@@ -1,0 +1,25 @@
+{
+  "name": "shulkerdb",
+  "version": "1.0.0",
+  "description": "Fast, crash-consistent database for the Minecraft Bedrock Script API",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": ["src", "entities"],
+  "peerDependencies": {
+    "@minecraft/server": ">=2.11.0"
+  },
+  "keywords": ["minecraft", "bedrock", "script-api", "database", "dynamic-properties"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Duskaraa/shulkerdb"
+  },
+  "author": "Duskaraa",
+  "license": "MIT"
+}
