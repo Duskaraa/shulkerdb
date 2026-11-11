@@ -11,7 +11,7 @@ export interface ShulkerVaultOptions {
   dimension?: string;
   /**
    * Location of the storage entities. A ticking area is created here.
-   * @default { x: 0.5, y: 318, z: 0.5 }
+   * @default { x: 0.5, y: dimension.heightRange.max - 2, z: 0.5 }
    */
   location?: Vector3;
   /**
@@ -36,10 +36,12 @@ export interface ShulkerVaultOptions {
  * ready are queued and applied once it is. Reads (`get`, `has`, `keys`, `size`) before it is ready throw an `Error`.
  *
  * Storage entities that are moved (for example with `/tp`) are returned to their location every 200 ticks.
- * If a storage entity is removed, the records stored in it are dropped, a warning is logged and `stats.lost` increases.
+ * If a storage entity goes missing (removed, or moved to a chunk that is not loaded), its records are kept
+ * and reading them throws until the entity comes back. The vault searches every dimension for it and restores
+ * it automatically; `stats.missing` counts storage entities currently missing.
  *
  * @example
- * import { ShulkerVault } from "shulkerdb";
+ * import { ShulkerVault } from "./shulkerdb/index.js";
  *
  * const vault = new ShulkerVault("kits");
  * await vault.ready;
@@ -49,6 +51,7 @@ export interface ShulkerVaultOptions {
 export class ShulkerVault {
   /**
    * Creates a vault.
+   * Creating a vault for a namespace that is already open returns the existing instance (its options are not changed).
    * @param ns Namespace that isolates this vault from others.
    * @param opt Options.
    */
@@ -57,14 +60,18 @@ export class ShulkerVault {
   /** The namespace this vault was created with. */
   readonly ns: string;
 
-  /** Resolves when the vault has booted and is fully usable. */
+  /**
+   * Resolves when the vault has booted and is fully usable. Rejects if the
+   * storage chunk does not load within 1200 ticks or the storage can't be
+   * read during boot; the vault is then disposed and queued calls are discarded.
+   */
   readonly ready: Promise<void>;
 
   /** `true` once {@link ShulkerVault.ready} has resolved. */
   readonly isReady: boolean;
 
-  /** Recovery counters: records restored from their previous version on boot, and records dropped as unrecoverable. */
-  readonly stats: { recovered: number; lost: number };
+  /** Recovery counters: records restored from their previous version, records dropped as unrecoverable, and storage entities currently missing. */
+  readonly stats: { recovered: number; lost: number; missing: number };
 
   /**
    * Number of stored keys.
@@ -89,12 +96,16 @@ export class ShulkerVault {
    * Stores a single item. Queued if the vault is not ready yet.
    * @param k The key.
    * @param item The item to store.
+   * @throws {TypeError} If the key is invalid.
+   * @throws {Error} If the vault was disposed, or the storage entity that receives the items can't be written right now.
    */
   set(k: string, item: ItemStack): void;
   /**
    * Stores a list of items, preserving order. Queued if the vault is not ready yet.
    * @param k The key.
    * @param items The items to store.
+   * @throws {TypeError} If the key is invalid.
+   * @throws {Error} If the vault was disposed, or the storage entity that receives the items can't be written right now.
    */
   set(k: string, items: ItemStack[]): void;
 
@@ -102,7 +113,7 @@ export class ShulkerVault {
    * Reads the items stored under a key.
    * @param k The key.
    * @returns An `ItemStack` if stored as a single item, an array if stored as a list, or `undefined` if missing.
-   * @throws {Error} If the vault is not ready yet.
+   * @throws {Error} If the vault is not ready yet, or if the storage entity holding the items is missing or not loaded.
    */
   get(k: string): ItemStack | ItemStack[] | undefined;
 

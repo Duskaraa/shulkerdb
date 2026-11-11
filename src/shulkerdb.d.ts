@@ -35,7 +35,7 @@ export interface ShulkerDBOptions {
  *
  * @typeParam T Type of the stored values.
  * @example
- * import { ShulkerDB } from "shulkerdb";
+ * import { ShulkerDB } from "./shulkerdb/index.js";
  *
  * const db = new ShulkerDB<{ coins: number }>("players");
  * db.set("steve", { coins: 10 });
@@ -45,9 +45,10 @@ export interface ShulkerDBOptions {
 export class ShulkerDB<T = unknown> {
   /**
    * Opens (and loads) the database stored under a namespace.
-   * @param ns Namespace that isolates this database from others. Must be a string without the control characters U+0001 and U+0002.
+   * Opening a namespace that is already open returns the existing instance (its options are not changed).
+   * @param ns Namespace that isolates this database from others. Must be a string without the control characters U+0000, U+0001 and U+0002. Namespaces starting with `sv_` are reserved for {@link ShulkerVault}.
    * @param opt Tuning options.
-   * @throws {TypeError} If the namespace is invalid.
+   * @throws {TypeError} If the namespace is invalid or reserved.
    */
   constructor(ns: string, opt?: ShulkerDBOptions);
 
@@ -69,10 +70,11 @@ export class ShulkerDB<T = unknown> {
 
   /**
    * Stores a value. Passing `undefined` deletes the key.
-   * @param k Key, at most 512 UTF-8 bytes and free of U+0001 and U+0002.
-   * @param v JSON-serializable value.
+   * @param k Key, at most 512 UTF-8 bytes, free of U+0000, U+0001, U+0002 and unpaired surrogates.
+   * @param v JSON-serializable value. A value that cannot be serialized (a `BigInt`, a circular object) is not saved: a warning is logged on the next flush and the key keeps the last value that was written to storage (or is removed if it was never written). Until that flush, `get` returns the unsaved value.
    * @returns This database, for chaining.
    * @throws {TypeError} If the key is new and invalid.
+   * @throws {Error} If the database was disposed.
    */
   set(k: string, v: T): this;
 
@@ -112,6 +114,6 @@ export class ShulkerDB<T = unknown> {
    */
   flushSome(): number;
 
-  /** Flushes pending changes, stops the background timer, and unsubscribes from shutdown events. */
+  /** Flushes pending changes, stops the background timer, and unsubscribes from shutdown events. Later calls to `set` or `delete` throw. */
   dispose(): void;
 }
