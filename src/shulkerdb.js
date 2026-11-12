@@ -4,18 +4,19 @@ const sep = "\u0001";
 const end = "\u0002";
 const reserved = /[\u0000-\u0002]/;
 const limit = 32000;
+const S = 32768;
 const raw = Symbol("raw");
 const open = new Map();
 export function _reset() { open.clear(); }
 export const inner = Symbol("inner");
 
 export function checkKey(k) {
-  if (typeof k !== "string" || reserved.test(k) || lone.test(k) || bytes(k) > 512) throw new TypeError("invalid key");
+  if (typeof k !== "string" || reserved.test(k) || (!ascii.test(k) && lone.test(k)) || (k.length > 170 && bytes(k) > 512)) throw new TypeError("invalid key");
 }
 
 const ascii = /^[\x00-\x7f]*$/;
 const narrow = /[\x00-\x7f]+/g;
-const two = /[\u0080-\u07ff]+/g;
+const two = /[\u0080-߿]+/g;
 const surr = /[\ud800-\udfff]+/g;
 const pair = /[\ud800-\udbff][\udc00-\udfff]/g;
 const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
@@ -54,10 +55,18 @@ function rank(k, v, first) {
   return first.has(k) ? 2 : 3;
 }
 
-function commit(rec, first, size) {
+function commit(rec, first, size, deps) {
   const f = first ?? new Set();
   const at = new Map();
-  for (const k of f) at.set(k, at.size);
+  let pos = 0;
+  const go = k => {
+    if (at.has(k)) return;
+    at.set(k, -1);
+    const d = deps?.get(k);
+    if (d) for (const x of d) if (f.has(x)) go(x);
+    at.set(k, pos++);
+  };
+  for (const k of f) go(k);
   const ks = Object.keys(rec).map((k, i) => [rank(k, rec[k], f), at.get(k) ?? i, k]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
   let part = {}, n = 0;
   for (const [, , k] of ks) {
@@ -66,6 +75,7 @@ function commit(rec, first, size) {
   }
   if (n) world.setDynamicProperties(part);
   f.clear();
+  deps?.clear();
 }
 
 export class ShulkerDB {
@@ -79,10 +89,6 @@ export class ShulkerDB {
     this.cap = Number.isFinite(cap) ? Math.max(1, Math.min(cap, limit)) : 12000;
     this.budget = opt.budgetMs ?? 3;
     this.batch = opt.batchSize ?? 256;
-    this.vals = new Map();
-    this.strs = new Map();
-    this.lens = new Map();
-    this.stale = new Set();
     this.home = new Map();
     this.bins = [];
     this.big = new Map();
@@ -94,6 +100,8 @@ export class ShulkerDB {
     this.first = new Set();
     this.left = new Map();
     this.redo = new Set();
+    this.deps = new Map();
+    this.src = new Set();
     this.#load();
     open.set(ns, this);
     const every = opt.flushEvery ?? 20;
@@ -102,8 +110,9 @@ export class ShulkerDB {
   }
 
   #load() {
-    const pre = this.pre, n = pre.length;
-    const lila = [];
+    const pre = this.pre, n = pre.length, home = this.home, bins = this.bins;
+    const lila = [], dups = [];
+    let total = 0;
     for (const id of world.getDynamicPropertyIds()) {
       if (!id.startsWith(pre)) continue;
       const tag = id[n], rest = id.slice(n + 1);
@@ -111,19 +120,25 @@ export class ShulkerDB {
       const str = world.getDynamicProperty(id);
       if (typeof str !== "string") continue;
       if (tag === "b") {
-        const at = parseInt(rest, 36);
-        const bin = (this.bins[at] = { keys: new Set(), size: str.length, est: true });
-        let i = 0;
-        while (i < str.length) {
-          let j = str.indexOf(end, i);
-          if (j < 0) j = str.length;
-          const a = str.indexOf(sep, i);
-          const k = str.slice(i, a), s = str.slice(a + 1, j);
-          i = j + 1;
-          if (this.vals.has(k)) { this.dirty.add(at); continue; }
-          this.vals.set(k, raw); this.strs.set(k, s); this.home.set(k, at);
-          bin.keys.add(k);
+        const at = parseInt(rest, 36), base = at * S;
+        let bin;
+        if (str[0] === end) {
+          const i = str.indexOf(end, 1);
+          if (i < 0) { bin = { ks: [], vs: [], raw: null, size: 0, gap: 0 }; console.warn(`[ShulkerDB ${this.ns}] corrupt bucket "${id}" dropped`); this.dirty.add(at); }
+          else bin = { ks: str.slice(1, i).split(sep), vs: null, raw: str.slice(i + 1), size: str.length, gap: 0 };
+        } else {
+          const m = this.#legacy(str);
+          bin = { ks: [...m.keys()], vs: [...m.values()], raw: null, size: str.length, gap: 0 };
+          this.dirty.add(at);
         }
+        bins[at] = bin;
+        const ks = bin.ks;
+        for (let i = 0; i < ks.length; i++) {
+          const c = home.size;
+          home.set(ks[i], base + i);
+          if (home.size === c) dups.push(at, i);
+        }
+        total += str.length;
       } else if (tag === "h") {
         let head;
         try { head = JSON.parse(str); } catch { head = null; }
@@ -136,10 +151,18 @@ export class ShulkerDB {
           s += p;
         }
         if (s === null) { console.warn(`[ShulkerDB ${this.ns}] incomplete record "${k}" dropped`); commit({ [id]: undefined }, null, 1); continue; }
-        if (this.home.has(k)) { const at = this.home.get(k); this.bins[at].keys.delete(k); this.dirty.add(at); this.home.delete(k); }
-        this.vals.set(k, raw); this.strs.set(k, s); this.big.set(k, { n: parts, g });
+        this.big.set(k, { n: parts, g, s, v: raw });
       }
     }
+    for (let d = 0; d < dups.length; d += 2) {
+      const at = dups[d], i = dups[d + 1], bin = bins[at], k = bin.ks[i];
+      bin.ks[i] = null; bin.gap++; this.dirty.add(at);
+      for (let j = 0; j < bins.length; j++) {
+        const x = bins[j] ? bins[j].ks.indexOf(k) : -1;
+        if (x >= 0) { home.set(k, j * S + x); break; }
+      }
+    }
+    for (const k of this.big.keys()) { const h = home.get(k); if (h !== undefined) this.#out(h, k); }
     const orphans = {};
     for (const id of lila) {
       const [k, g, i] = id.slice(n + 1).split(sep);
@@ -147,128 +170,168 @@ export class ShulkerDB {
       if (!b || b.g !== +g || !(+i < b.n)) orphans[id] = undefined;
     }
     commit(orphans, null, this.batch);
-    for (let i = 0; i < this.bins.length; i++) this.bins[i] ??= { keys: new Set(), size: 0 };
-    this.open = this.bins.findIndex(b => b.size < this.cap * 0.75);
+    for (let i = 0; i < bins.length; i++) bins[i] ??= { ks: [], vs: [], raw: null, size: 0, gap: 0 };
+    if (home.size) this.avg = Math.max(8, Math.ceil(total / home.size));
+    this.open = bins.findIndex(b => b.size < this.cap * 0.75);
   }
 
-  get size() { return this.vals.size; }
+  #legacy(str) {
+    const m = new Map();
+    let i = 0;
+    while (i < str.length) {
+      let j = str.indexOf(end, i);
+      if (j < 0) j = str.length;
+      const a = str.indexOf(sep, i);
+      const k = str.slice(i, a), s = str.slice(a + 1, j);
+      i = j + 1;
+      if (m.has(k)) continue;
+      try { m.set(k, JSON.parse(s)); } catch { console.warn(`[ShulkerDB ${this.ns}] corrupt record "${k}" dropped`); }
+    }
+    return m;
+  }
+
+  #wake(at) {
+    const bin = this.bins[at];
+    if (bin.vs) return bin;
+    let vs = null;
+    try { vs = JSON.parse(bin.raw); } catch {}
+    bin.raw = null;
+    if (!Array.isArray(vs) || vs.length !== bin.ks.length) {
+      console.warn(`[ShulkerDB ${this.ns}] corrupt bucket "${this.#binId(at)}" dropped`);
+      bin.ks.forEach((k, i) => { if (k !== null && this.home.get(k) === at * S + i) this.home.delete(k); });
+      bin.ks = []; bin.vs = []; bin.gap = 0;
+      this.dirty.add(at);
+      return bin;
+    }
+    bin.vs = vs;
+    return bin;
+  }
+
+  #pack(at) {
+    const bin = this.#wake(at), ks = bin.ks, vs = bin.vs, base = at * S;
+    let j = 0;
+    for (let i = 0; i < ks.length; i++) {
+      const k = ks[i];
+      if (k === null) continue;
+      if (i !== j) { ks[j] = k; vs[j] = vs[i]; this.home.set(k, base + j); }
+      j++;
+    }
+    ks.length = vs.length = j;
+    bin.gap = 0;
+    return bin;
+  }
+
+  get size() { return this.home.size + this.big.size; }
   get pending() { return this.dirty.size + this.bigDirty.size; }
-  has(k) { return this.vals.has(k); }
-  keys() { return this.vals.keys(); }
-  *entries() { for (const k of this.vals.keys()) yield [k, this.get(k)]; }
+  has(k) { return this.home.has(k) || this.big.has(k); }
+  *keys() { yield* this.home.keys(); yield* this.big.keys(); }
+  *entries() { for (const k of this.keys()) yield [k, this.get(k)]; }
 
   get(k) {
-    let v = this.vals.get(k);
-    if (v === raw) {
-      try { v = JSON.parse(this.strs.get(k)); }
+    const h = this.home.get(k);
+    if (h !== undefined) { const at = (h / S) | 0; return (this.bins[at].vs ?? this.#wake(at).vs)[h - at * S]; }
+    const b = this.big.get(k);
+    if (b === undefined) return undefined;
+    if (b.v === raw) {
+      try { b.v = JSON.parse(b.s); }
       catch { console.warn(`[ShulkerDB ${this.ns}] corrupt record "${k}" dropped`); this.delete(k); return undefined; }
-      this.vals.set(k, v);
     }
-    return v;
+    return b.v;
   }
 
   set(k, v) {
     if (v === undefined) { this.delete(k); return this; }
     if (this.gone) throw new Error(`ShulkerDB "${this.ns}" was disposed`);
-    if (!this.vals.has(k)) checkKey(k);
-    this.vals.set(k, v);
-    this.stale.add(k);
-    if (this.big.has(k)) this.bigDirty.add(k);
-    else {
-      const at = this.home.get(k);
-      if (at === undefined) {
-        const to = this.#bin(k, this.#len(k)), from = this.left.get(k);
-        if (from !== undefined && from !== to) { this.must.add(to); this.first.add(this.#binId(to)); }
+    const h = this.home.get(k);
+    if (h !== undefined) {
+      const at = (h / S) | 0, bin = this.#wake(at);
+      if (this.home.get(k) === h) {
+        bin.vs[h - at * S] = v; this.#odd(bin, v); this.dirty.add(at);
+        return this;
       }
-      else this.dirty.add(at);
+    }
+    const b = this.big.get(k);
+    if (b !== undefined) { b.v = v; b.done = undefined; this.bigDirty.add(k); return this; }
+    checkKey(k);
+    const from = this.left.get(k);
+    if (from >= 0) this.src.add(from);
+    const to = this.#bin(k, v, Math.min(this.avg, this.cap));
+    if (from !== undefined && from !== to) {
+      this.must.add(to); this.first.add(this.#binId(to));
+      if (from >= 0) this.#dep(to, from);
     }
     return this;
   }
 
   delete(k) {
     if (this.gone) throw new Error(`ShulkerDB "${this.ns}" was disposed`);
-    if (!this.vals.has(k)) return false;
-    if (this.big.has(k)) { this.#dropBig(k); this.left.set(k, -1); }
-    else { this.left.set(k, this.home.get(k)); this.#unbin(k); }
-    this.vals.delete(k); this.strs.delete(k); this.lens.delete(k); this.stale.delete(k);
+    const h = this.home.get(k);
+    if (h !== undefined) {
+      const at = this.#out(h, k), bin = this.bins[at];
+      this.left.set(k, at);
+      bin.size = Math.max(0, bin.size - this.avg);
+      if (bin.size < this.cap * 0.5 && (this.open < 0 || at < this.open)) this.open = at;
+      return true;
+    }
+    if (!this.big.has(k)) return false;
+    this.#dropBig(k);
+    this.left.set(k, -1);
     return true;
   }
 
-  clear() { for (const k of [...this.vals.keys()]) this.delete(k); this.flush(); }
+  clear() { for (const k of [...this.keys()]) this.delete(k); this.flush(); }
 
-  #len(k) {
-    let n = this.lens.get(k);
-    if (n === undefined) {
-      const s = this.strs.get(k);
-      n = (s === undefined ? this.avg : bytes(s)) + bytes(k) + 2;
-      if (s !== undefined) this.lens.set(k, n);
-    }
-    return n;
+  #odd(bin, v) {
+    const t = typeof v;
+    if (t === "function" || t === "symbol" || t === "bigint" || (t === "object" && v !== null && typeof v.toJSON === "function")) bin.odd = true;
   }
 
-  #bin(k, len) {
-    let at = this.open;
-    if (at < 0 || !this.#fits(at, len)) {
-      at = this.bins.findIndex((b, i) => b.size + len <= this.cap && this.#fits(i, len));
-      if (at < 0) { at = this.bins.length; this.bins.push({ keys: new Set(), size: 0 }); }
-      this.open = at;
-    }
-    const bin = this.bins[at];
-    bin.keys.add(k); bin.size += len;
-    this.home.set(k, at); this.dirty.add(at);
+  #out(h, k) {
+    const at = (h / S) | 0, i = h - at * S, bin = this.bins[at];
+    bin.ks[i] = null;
+    if (bin.vs) bin.vs[i] = undefined;
+    bin.gap++;
+    this.home.delete(k); this.dirty.add(at);
     return at;
   }
 
-  #fits(at, len) {
-    const bin = this.bins[at];
-    if (bin.est) {
-      let size = 0;
-      for (const k of bin.keys) size += this.#len(k);
-      bin.size = size; bin.est = false;
+  #bin(k, v, len) {
+    let at = this.open;
+    const src = this.src;
+    if (at < 0 || src.has(at) || this.bins[at].size + len > this.cap) {
+      at = this.bins.findIndex((b, i) => b.size + len <= this.cap && !src.has(i));
+      if (at < 0) { at = this.bins.length; this.bins.push({ ks: [], vs: [], raw: null, size: 0, gap: 0 }); }
+      this.open = at;
     }
-    return bin.size + len <= this.cap;
-  }
-
-  #unbin(k) {
-    const at = this.home.get(k);
-    if (at === undefined) return;
-    const bin = this.bins[at];
-    bin.keys.delete(k);
-    bin.size -= this.#len(k);
-    this.home.delete(k); this.dirty.add(at);
-    if (bin.size < this.cap * 0.5 && (this.open < 0 || at < this.open)) this.open = at;
-  }
-
-  #str(k) {
-    if (!this.stale.has(k)) return this.strs.get(k);
-    this.stale.delete(k);
-    let s;
-    try { s = JSON.stringify(this.vals.get(k)); } catch (e) { s = e; }
-    if (typeof s !== "string") {
-      const old = this.strs.get(k);
-      console.warn(`[ShulkerDB ${this.ns}] "${k}" can't be saved as JSON (${s instanceof Error ? s.message : "unsupported value"}), ${old === undefined ? "dropped" : "kept the last saved value"}`);
-      if (old !== undefined) this.vals.set(k, raw);
-      return old;
-    }
-    const n = bytes(s) + bytes(k) + 2;
-    this.strs.set(k, s); this.lens.set(k, n);
-    if (n <= this.cap) this.avg = (this.avg * 7 + Math.min(n, this.avg * 2)) >> 3;
-    return s;
-  }
-
-  #forget(k) {
-    this.vals.delete(k); this.strs.delete(k); this.lens.delete(k); this.stale.delete(k); this.home.delete(k);
+    let bin = this.#wake(at);
+    if (bin.ks.length >= S - 1) bin = this.#pack(at);
+    const i = bin.ks.push(k) - 1;
+    (bin.fresh ??= new Set()).add(k);
+    bin.vs.push(v); this.#odd(bin, v);
+    bin.size += len;
+    this.home.set(k, at * S + i); this.dirty.add(at);
+    return at;
   }
 
   #binId(at) { return `${this.pre}b${at.toString(36)}`; }
 
   #part(k, g, i) { return `${this.pre}p${k}${sep}${g}${sep}${i}`; }
 
-  #toBig(k) { this.big.set(k, { n: 0, g: 0 }); this.bigDirty.add(k); this.mustBig.add(k); this.first.add(`${this.pre}h${k}`); }
+  #gen(k) {
+    try { return JSON.parse(world.getDynamicProperty(`${this.pre}h${k}`))[2] ?? 0; } catch { return 0; }
+  }
 
-  #moveToBin(k) {
-    const to = this.#bin(k, this.#len(k));
+  #moveToBin(k, v, len) {
+    const to = this.#bin(k, v, len);
     this.must.add(to); this.first.add(this.#binId(to));
+    return to;
+  }
+
+  #dep(to, from) {
+    const a = this.#binId(from);
+    let d = this.deps.get(a);
+    if (!d) this.deps.set(a, (d = new Set()));
+    d.add(this.#binId(to));
   }
 
   #dropBig(k, rec) {
@@ -276,33 +339,88 @@ export class ShulkerDB {
     const out = rec ?? {};
     out[`${this.pre}h${k}`] = undefined;
     for (let i = 0; i < n; i++) out[this.#part(k, g, i)] = undefined;
-    if (!rec) commit(out, null, this.batch);
+    if (!rec) try { commit(out, null, this.batch); } catch (e) { this.bigDirty.add(k); this.mustBig.add(k); throw e; }
     this.big.delete(k); this.bigDirty.delete(k);
   }
 
+  #disk(at) {
+    const str = world.getDynamicProperty(this.#binId(at));
+    if (typeof str !== "string") return null;
+    if (str[0] !== end) return this.#legacy(str);
+    const i = str.indexOf(end, 1);
+    try { const ks = str.slice(1, i).split(sep), vs = JSON.parse(str.slice(i + 1)); return new Map(ks.map((k, j) => [k, vs[j]])); } catch { return null; }
+  }
+
   #write(rec, at) {
-    const bin = this.bins[at];
-    let out = "", size = 0, spill = null;
-    for (const k of bin.keys) {
-      if (!this.vals.has(k)) { bin.keys.delete(k); if (this.home.get(k) === at) this.home.delete(k); continue; }
-      const s = this.#str(k);
-      if (s === undefined) { bin.keys.delete(k); this.#forget(k); continue; }
-      const len = this.#len(k);
-      if (len > this.cap) { bin.keys.delete(k); this.home.delete(k); this.#toBig(k); continue; }
-      if (size + len > limit) { (spill ??= []).push(k); continue; }
-      out += (out ? end : "") + k + sep + s;
+    let bin = this.#wake(at);
+    if (bin.gap) bin = this.#pack(at);
+    let ks = null, out = null, size = Infinity;
+    if (bin.ks.length && !bin.odd) try { out = JSON.stringify(bin.vs); ks = bin.ks.join(sep); if (out.length + ks.length < limit) size = bytes(ks) + bytes(out) + 2; } catch {}
+    if (bin.ks.length && size > limit) { [ks, out] = this.#trim(at); size = bytes(ks) + bytes(out) + 2; }
+    const c = bin.ks.length;
+    if (!c) { bin.size = 0; rec[this.#binId(at)] = undefined; return; }
+    bin.size = size;
+    this.avg = Math.max(8, (this.avg * 7 + Math.min(size / c, this.avg * 2)) >> 3);
+    rec[this.#binId(at)] = end + ks + end + out;
+  }
+
+  #trim(at) {
+    const bin = this.bins[at], K = bin.ks.slice(), V = bin.vs, base = at * S, ks = [], vs = [];
+    let size = 4, disk, spill = null;
+    bin.odd = false;
+    for (let i = 0; i < K.length; i++) {
+      const k = K[i];
+      let s;
+      try { s = JSON.stringify(V[i]); } catch (e) { s = e; }
+      if (typeof s !== "string") {
+        disk ??= this.#disk(at) ?? new Map();
+        const kept = disk.has(k) && !bin.fresh?.has(k);
+        console.warn(`[ShulkerDB ${this.ns}] "${k}" can't be saved as JSON (${s instanceof Error ? s.message : "unsupported value"}), ${kept ? "kept the last saved value" : "dropped"}`);
+        if (!kept) { this.#out(base + i, k); continue; }
+        V[i] = disk.get(k);
+        s = JSON.stringify(V[i]);
+      }
+      const len = bytes(s) + bytes(k) + 2;
+      if (len > this.cap || len > limit - 4) {
+        const w = V[i];
+        this.#out(base + i, k);
+        this.big.set(k, { n: 0, g: this.redo.size ? this.#gen(k) : 0, v: w, s: undefined, done: s });
+        this.bigDirty.add(k); this.mustBig.add(k); this.first.add(`${this.pre}h${k}`);
+        continue;
+      }
+      if (size + len > limit) { (spill ??= []).push(i, len); continue; }
+      ks.push(k); vs.push(s);
       size += len;
     }
-    bin.size = size; bin.est = false;
-    rec[this.#binId(at)] = out || undefined;
-    if (spill) for (const k of spill) { bin.keys.delete(k); this.home.delete(k); this.#moveToBin(k); }
+    if (spill) {
+      bin.size = size;
+      this.src.add(at);
+      for (let j = 0; j < spill.length; j += 2) {
+        const i = spill[j], k = K[i], v = V[i];
+        this.#out(base + i, k);
+        this.#dep(this.#moveToBin(k, v, spill[j + 1]), at);
+      }
+    }
+    this.#pack(at);
+    return [ks.join(sep), "[" + vs.join(",") + "]"];
   }
 
   #writeBig(rec, k) {
-    const s = this.#str(k);
-    const old = this.big.get(k);
-    if (this.#len(k) <= this.cap) { this.#dropBig(k, rec); this.#moveToBin(k); return; }
-    const parts = split(s), g = old.g + 1, h = `${this.pre}h${k}`;
+    const b = this.big.get(k);
+    let s = b.s;
+    if (b.done !== undefined) { s = b.done; b.done = undefined; }
+    else if (b.v !== raw) {
+      try { s = JSON.stringify(b.v); } catch (e) { s = e; }
+      if (typeof s !== "string") {
+        console.warn(`[ShulkerDB ${this.ns}] "${k}" can't be saved as JSON (${s instanceof Error ? s.message : "unsupported value"}), ${b.s === undefined ? "dropped" : "kept the last saved value"}`);
+        if (b.s === undefined) this.#dropBig(k, rec);
+        else b.v = raw;
+        return;
+      }
+    }
+    const len = bytes(s) + bytes(k) + 2;
+    if (len <= this.cap && len <= limit - 4) { const v = b.v === raw ? JSON.parse(s) : b.v; this.#dropBig(k, rec); this.#moveToBin(k, v, len); return; }
+    const parts = split(s), g = b.g + 1, h = `${this.pre}h${k}`;
     const lead = this.first.has(h);
     for (let i = 0; i < parts.length; i++) {
       const id = this.#part(k, g, i);
@@ -311,17 +429,17 @@ export class ShulkerDB {
     }
     if (this.first.delete(h)) this.first.add(h);
     rec[h] = JSON.stringify([k, parts.length, g]);
-    for (let i = 0; i < old.n; i++) rec[this.#part(k, old.g, i)] = undefined;
-    this.big.set(k, { n: parts.length, g });
+    for (let i = 0; i < b.n; i++) rec[this.#part(k, b.g, i)] = undefined;
+    b.n = parts.length; b.g = g; b.s = s;
   }
 
   #commit(rec, took, tookBig) {
     for (const k of this.redo) if (!(k in rec)) rec[k] = undefined;
     this.redo.clear();
-    try { commit(rec, this.first, this.batch); } catch (e) {
+    try { commit(rec, this.first, this.batch, this.deps); this.src.clear(); for (const at of took) this.bins[at].fresh = null; } catch (e) {
       for (const k in rec) if (rec[k] === undefined) this.redo.add(k);
-      for (const at of took) this.dirty.add(at);
-      for (const k of tookBig) if (this.big.has(k)) this.bigDirty.add(k);
+      for (const at of took) { this.dirty.add(at); this.must.add(at); }
+      for (const k of tookBig) if (this.big.has(k)) { this.bigDirty.add(k); this.mustBig.add(k); }
       throw e;
     }
   }

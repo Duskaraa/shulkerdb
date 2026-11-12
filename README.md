@@ -43,12 +43,12 @@ db.set(player.id, { kills: 3, money: 120 });
 
 const data = db.get(player.id);
 data.kills++;
-db.set(player.id, data); // get gives you the live object, so call set again or the change won't be saved
+db.set(player.id, data); // get gives you the live object, call set again so the change is saved
 
 for (const [key, value] of db.entries()) console.log(key, value.kills);
 ```
 
-Other methods: `delete`, `clear`, `size`, `keys()`, `flush()` to write everything now, `pending` to see how much is waiting to be written, and `dispose()` if you want to stop it.
+Other methods: `delete`, `clear`, `size`, `keys()`, `flush()` to write everything now, `pending` to see how much is waiting to be written, and `dispose()` if you want to stop it. If you go through `keys()` or `entries()` across several ticks, take a copy first (`[...db.keys()]`), a save in the middle can move records around.
 
 A few rules:
 - keys are strings up to 512 bytes and can't have the characters `\u0000`, `\u0001`, `\u0002` or broken surrogate pairs (the game cuts strings at `\u0000`)
@@ -94,15 +94,15 @@ The one exception is a crash right after the vault created a new storage entity 
 
 Dynamic properties are kept in memory and the game writes all of a pack's properties to disk together on every autosave. That cost goes up with the number of keys, not the size: 5,000 small keys took 379 ms to save, and the same data in 50 keys of 12 KB took 5 ms. Also, setting a lot of keys in one `setDynamicProperties` call gets really slow, 50,000 keys took 35 s.
 
-So ShulkerDB puts many records in one property (a bucket of about 12 KB). `set` only marks the record as changed, and every second it writes the changed buckets with a small time limit, so it never freezes the game. When the world closes it writes whatever is left. A record bigger than a bucket gets split into parts of 32,000 bytes. The limit is about 32 KB of UTF-8, not 32K characters, and in my tests Con-Database, Tendrock and QuickDB all failed with 32 KB records.
+So ShulkerDB puts many records in one property (a bucket of about 12 KB). Each bucket keeps its keys apart from its values, so opening a store only reads the keys, and a bucket's values get parsed in one go the first time you read one of them. `set` only marks the bucket as changed, and every second it writes the changed buckets with a small time limit, so it never freezes the game. When the world closes it writes whatever is left. A record that doesn't fit in one property gets split into parts of 32,000 bytes. The limit is about 32 KB of UTF-8, not 32K characters, and in my tests Con-Database, Tendrock and QuickDB all failed with 32 KB records.
 
-About crashes: nothing is on disk until the next autosave or until the world closes normally, that's how every Script API storage works. If the game crashes you lose the changes since the last autosave, but what's left is never half-written. Records moving between buckets get written to the new place first, and big records get a new set of parts before the old one is removed. I tested it closing the game with Alt+F4 while it was writing.
+About crashes: nothing is on disk until the next autosave or until the world closes normally, that's how every Script API storage works. If the game crashes you lose the changes since the last autosave, but what's left is never half-written. Records moving between buckets get written to the new place first, even when one save moves them several times, and big records get a new set of parts before the old one is removed. Data saved by 1.1.0 or older is read as is and rewritten in the new format the next time it's saved. Going back to 1.1.0 after that doesn't work, it can't read the new format. I tested it closing the game with Alt+F4 while it was writing.
 
 The vault uses a ticking area from `world.tickingAreaManager`, which belongs to the pack and doesn't count against the 10 command ticking areas. Items and their index get saved at different moments, so every update goes to new slots and the old ones are kept for a minute. On boot, every entry is checked against a fingerprint of its items (type, amount, name, lore, lock mode, the size of its dynamic properties and, for items that don't stack, enchantments and durability). If it doesn't match it goes back to the previous version, and if that doesn't match either it gets dropped, so it never gives you empty slots or another key's items.
 
 ## Performance
 
-I ran the same tests for every DB on a Bedrock Dedicated Server 1.26.60, with the same pack and the same data, so the only thing that changes is the DB. Every number is measured, nothing is estimated. Write and updates include the time it takes to actually save, and reopen is restarting the server, opening the store and reading everything back.
+I ran the same tests for every DB on a Bedrock Dedicated Server 1.26.60, with the same pack and the same data, so the only thing that changes is the DB. Every number is measured, nothing is estimated. Write and updates include the time it takes to actually save. Reopen is restarting the server, opening the store and reading everything back, and it includes the work a DB does on its own when the world loads (Tendrock reads all its properties there).
 
 What matters most in a real pack is updates: player data changes all the time, and every key you have is something the game has to save on each autosave. That's what ShulkerDB is built around.
 
@@ -110,30 +110,41 @@ What matters most in a real pack is updates: player data changes all the time, a
 
 | | Write | Updates | Reopen | Keys | World size |
 |---|---:|---:|---:|---:|---:|
-| **ShulkerDB** | **70 ms** | **37 ms** | 28 ms | **12** | **228 KB** |
-| Raw dynamic properties | 101 ms | 79 ms | 15 ms | 2,000 | 240 KB |
-| [QuickDB](https://github.com/nperma/QuickDB) | 97 ms | 111 ms | 32 ms | 2,000 | 267 KB |
-| [Con-Database](https://github.com/Con-JS-Development/Con-Database) | 108 ms | 149 ms | 27 ms | 2,000 | 275 KB |
-| [Tendrock](https://github.com/AbbottMc/tendrock-database) | 90 ms | 84 ms | 2 ms | 2,000 | 298 KB |
-| [bedrock-database](https://github.com/smell-of-curry/bedrock-database) | 16,053 ms | 31,521 ms | 14 ms | 32 | 232 KB |
+| **ShulkerDB** | **44 ms** | **36 ms** | 14 ms | **11** | **228 KB** |
+| Raw dynamic properties | 67 ms | 83 ms | 14 ms | 2,000 | 239 KB |
+| [QuickDB](https://github.com/nperma/QuickDB) | 68 ms | 88 ms | 20 ms | 2,000 | 267 KB |
+| [Con-Database](https://github.com/Con-JS-Development/Con-Database) | 68 ms | 105 ms | 12 ms | 2,000 | 275 KB |
+| [Tendrock](https://github.com/AbbottMc/tendrock-database) | 84 ms | 69 ms | 19 ms | 2,000 | 298 KB |
+| [bedrock-database](https://github.com/smell-of-curry/bedrock-database) | 10,713 ms | 24,820 ms | 11 ms | 32 | 232 KB |
 
 ### Bigger loads
 
-| | 5,000 × 100 B updates | 5,000 × 2 KB updates | 50,000 × 100 B write | 50,000 × 100 B updates | Keys at 50,000 |
-|---|---:|---:|---:|---:|---:|
-| **ShulkerDB** | **159 ms** | **316 ms** | 2,877 ms | 2,141 ms | **488** |
-| Raw dynamic properties | 306 ms | 520 ms | 1,338 ms | 2,008 ms | 50,000 |
-| QuickDB | 323 ms | 583 ms | 1,999 ms | 4,215 ms | 50,000 |
-| Con-Database | 417 ms | 610 ms | 1,750 ms | 2,997 ms | 50,000 |
-| Tendrock | 539 ms | 643 ms | 87,494 ms | 160,070 ms | 50,000 |
+| | 5,000 × 100 B | | | 5,000 × 2 KB | | | 50,000 × 100 B | | | Keys at 50,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| | Write | Updates | Reopen | Write | Updates | Reopen | Write | Updates | Reopen | |
+| **ShulkerDB** | **115** | **132** | **24** | **3,116** | **246** | **67** | **1,115** | **971** | 305 | **405** |
+| Raw dynamic properties | 128 | 257 | 28 | 3,244 | 484 | 85 | 1,249 | 2,218 | **289** | 50,000 |
+| QuickDB | 148 | 337 | 39 | 3,450 | 542 | 97 | 1,564 | 2,815 | 397 | 50,000 |
+| Con-Database | 153 | 383 | 31 | 3,399 | 594 | 97 | 1,914 | 3,114 | 412 | 50,000 |
+| Tendrock | 318 | 538 | 48 | 3,217 | 571 | 81 | 29,866 | 44,454 | 405 | 50,000 |
 
-Writing 5,000 records of 2 KB froze the server for more than 100 ms on 19 ticks with ShulkerDB and on 30 to 37 ticks with the others.
+Times in ms. Most packs don't read every record right after a restart, they open the store and read what they need. Opening a store with 50,000 records and reading one takes 39 ms with ShulkerDB and 327 to 356 ms with QuickDB, Con-Database and Tendrock, which load everything up front. Raw properties don't open anything, so they're at 0, but they're paying for 50,000 keys on every autosave.
 
-Where it doesn't win: reopening. ShulkerDB unpacks its buckets when it opens, so with 50,000 records it takes 728 ms while raw properties take 294 ms and Tendrock 124 ms. It happens once per restart and it's spread over several ticks.
+Where it doesn't win: reading all 50,000 records back after a restart, raw properties are about 5% faster (289 ms vs 305 ms). Most of that time is the game parsing JSON, which costs the same either way.
+
+Writing 5,000 records of 2 KB, the slowest tick was 140 ms with ShulkerDB and 156 to 217 ms with the others, but ShulkerDB had more ticks over 100 ms (19, the others 1 to 3), since it saves the backlog in bigger steps.
+
+### Compared to 1.1.0
+
+| 50,000 records | 1.1.0 | 1.2.0 |
+|---|---:|---:|
+| Write | 2,877 ms | 1,115 ms |
+| Updates | 2,141 ms | 971 ms |
+| Reopen | 728 ms | 305 ms |
 
 ### Edge cases
 
-Empty and 512-byte keys, unicode and split emojis, 30 KB to 1 MB values, 10,000-item arrays, and grow/shrink and churn runs, all read back after a restart:
+Empty and 512-byte keys, `__proto__` and `constructor` as keys, unicode and split emojis, 30 KB to 1 MB values, 10,000-item arrays, and grow/shrink and churn runs, all read back after a restart:
 
 | | Passed |
 |---|---:|
@@ -149,10 +160,10 @@ Empty and 512-byte keys, unicode and split emojis, 30 KB to 1 MB values, 10,000-
 
 | | Save | Open | Worst tick reading | World size | Edge cases |
 |---|---:|---:|---:|---:|---:|
-| **ShulkerVault** | **2 ms** | **704 ms** | **39 ms** | **64 KB** | **8 / 8** |
-| QIDB | 10,000 ms | 2,001 ms | 1,182 ms | 3,142 KB | 7 / 8 |
+| **ShulkerVault** | **11 ms** | **706 ms** | **37 ms** | **75 KB** | **8 / 8** |
+| QIDB | 9,993 ms | 2,005 ms | 1,037 ms | 2,880 KB | 7 / 8 |
 
-The tests ran on four server copies at the same time (Ryzen AI 9 HX 370, 32 GB), so take the absolute times as a reference. The comparison between DBs is what counts.
+The tests ran on five server copies at the same time (Ryzen AI 9 HX 370, 32 GB), so take the absolute times as a reference. The comparison between DBs is what counts.
 
 ## License
 
